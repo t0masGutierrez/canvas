@@ -1,0 +1,38 @@
+# Local Canvas auth/session state. Contains cookies; never commit.
+state.json
+login_state/
+storage_state*.json
+cookies*.json
+
+# Local secrets/debug output
+.env
+.env.local
+config.json
+*.log
+*.har
+screenshots/
+
+# Browser/database copies can contain Canvas cookies.
+Cookies
+Cookies-*
+*.db
+*.sqlite
+*.sqlite3
+
+# Python/generated files
+.venv/
+__pycache__/
+*.py[cod]
+.coverage
+.pytest_cache/
+.ruff_cache/
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# macOS/editor noise
+.DS_Store
+
+# Downloaded Canvas files
+files/

@@ -1,0 +1,37 @@
+usage: canvas [-h, --help] [--json] [--date | --name]
+             {setup, home, courses, announcements, assignments, grades, people, pages, files, syllabus, modules}
+
+Canvas LMS CLI
+
+options:
+  -h, --help  Show this help message
+  --json      Print pretty JSON instead of the default readable table
+  --date      Assignments filter: sort by descending due dates
+  --name      Assignments filter: sort names alphabetically
+
+Commands:
+    setup               Save your Canvas institution URL
+    home                Open the Canvas dashboard or a course home page
+    courses             List active courses
+    announcements       List announcements
+    assignments         List assignments
+    grades              List grades
+    people              List active people in a course
+    pages               List pages
+    files               Mirror course file links locally
+    syllabus            Open course syllabus page
+    modules             List modules
+
+Examples:
+    canvas setup https://school.instructure.com
+    canvas courses
+    canvas courses "PHY 382N"
+    canvas assignments phy382n
+    canvas grades phy
+    canvas modules 382n
+    canvas files "PHY 382N"
+    canvas home phy382n
+    canvas pages phy
+    canvas syllabus 382n
+    canvas people "PHY 382N"
+    canvas announcements phy382n

@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "canvas-lms-cli"
+version = "0.1.0"
+description = "Read-only Canvas LMS CLI"
+requires-python = ">=3.11"
+dependencies = [
+  "playwright>=1.40",
+]
+
+[project.scripts]
+canvas = "canvas:main"
+
+[tool.setuptools]
+py-modules = ["canvas"]
+
+[tool.setuptools.package-dir]
+"" = "src"
