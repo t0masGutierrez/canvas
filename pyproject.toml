@@ -4,18 +4,23 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "canvas-lms-cli"
-version = "0.1.0"
-description = "Read-only Canvas LMS CLI"
+version = "0.2.1"
+description = "A Command Line Interface for Canvas."
 requires-python = ">=3.11"
 dependencies = [
   "playwright>=1.40",
+  "certifi>=2024.2.2",
 ]
 
 [project.scripts]
 canvas = "canvas:main"
 
 [tool.setuptools]
-py-modules = ["canvas"]
+py-modules = ["canvas", "canvas_api", "canvas_content"]
+packages = ["canvas_browser"]
+
+[tool.setuptools.package-data]
+canvas_browser = ["extension/*.js"]
 
 [tool.setuptools.package-dir]
 "" = "src"

@@ -84,7 +84,7 @@ refresh_source() {
   rm -rf "$destination_dir/src"
   cp -R "$source_dir/src" "$destination_dir/src"
   cp "$source_dir/pyproject.toml" "$destination_dir/pyproject.toml"
-  copy_if_exists "$source_dir/README.md" "$destination_dir/README.md"
+  rm -f "$destination_dir/README.md"
   copy_if_exists "$source_dir/install.sh" "$destination_dir/install.sh"
   copy_if_exists "$source_dir/.gitignore" "$destination_dir/.gitignore"
 }
@@ -94,7 +94,7 @@ download_source() {
   archive="$tmpdir/source.tar.gz"
   curl -fsSL "$CANVAS_ARCHIVE_URL" -o "$archive" || fail "Could not download $CANVAS_ARCHIVE_URL"
   tar -xzf "$archive" -C "$tmpdir" || fail "Could not unpack downloaded source"
-  find "$tmpdir" -mindepth 1 -maxdepth 1 -type d | head -n 1
+  downloaded_source="$(find "$tmpdir" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 }
 
 profile_file_for_shell() {
@@ -140,11 +140,13 @@ write_launcher() {
   venv_canvas="$1"
   launcher="$2"
   mkdir -p "$(dirname "$launcher")"
+  launcher_tmp="$(mktemp "${launcher}.XXXXXX")"
   {
     printf '#!/usr/bin/env bash\n'
     printf 'exec %q "$@"\n' "$venv_canvas"
-  } > "$launcher"
-  chmod 755 "$launcher"
+  } > "$launcher_tmp"
+  chmod 755 "$launcher_tmp"
+  mv -f "$launcher_tmp" "$launcher"
 }
 
 main() {
@@ -169,7 +171,7 @@ main() {
   if [ -n "${CANVAS_SOURCE_DIR:-}" ]; then
     refresh_source "$CANVAS_SOURCE_DIR" "$source_root"
   else
-    downloaded_source="$(download_source)"
+    download_source
     refresh_source "$downloaded_source" "$source_root"
   fi
 

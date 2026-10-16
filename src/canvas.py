@@ -7,29 +7,40 @@ import hashlib
 import html
 import json
 import os
+import plistlib
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, urlencode, urlparse
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, Error as PlaywrightError
+
+from canvas_api import CanvasError, api_path, ensure_response, fetch_json, next_link, origin, request_get
+from canvas_content import CanvasContent, download_file
+from canvas_browser import live_states
 
 BASE_URL = ""
 CANVAS_REPO_ROOT = Path(__file__).resolve().parents[1]
-STATE_FILE = CANVAS_REPO_ROOT / "state.json"
-CONFIG_FILE = Path.home() / ".config/canvas-cli/config.json"
-CANVAS_FILES_ROOT = CANVAS_REPO_ROOT / "files"
+STATE_FILE = Path(os.environ.get("CANVAS_STATE_FILE", CANVAS_REPO_ROOT / "state.json"))
+CONFIG_FILE = Path(os.environ.get("CANVAS_CONFIG_FILE", Path.home() / ".config/canvas-cli/config.json"))
+CANVAS_FILES_ROOT = Path(os.environ.get("CANVAS_FILES_DIR", CANVAS_REPO_ROOT / "files"))
 CANVAS_HOST = ""
 CANVAS_CLI_AUTH_KEY = "canvas_cli_auth"
 CHROME_USER_DATA_DIR = Path.home() / "Library/Application Support/Google/Chrome"
 CHROME_COOKIE_EPOCH_OFFSET = 11644473600
-CHROME_APP_NAME = "Google Chrome"
+CHROME_APP_DIRS = (
+    Path.home() / "Applications/Chrome Apps.localized",
+    Path("/Applications/Chrome Apps.localized"),
+    Path.home() / "Applications",
+    Path("/Applications"),
+)
 
 
 def normalize_canvas_base_url(value: str) -> str:
@@ -86,48 +97,53 @@ KNOWN_COLUMNS = [
     (re.compile(r"/users(?:\?|$)"), ["name"]),
 ]
 
-COMMANDS = ["setup", "home", "courses", "announcements", "assignments", "grades", "people", "pages", "files", "syllabus", "modules"]
+COMMANDS = ["setup", "auth", "capabilities", "home", "courses", "course", "read", "api", "announcements", "assignments", "grades", "people", "pages", "files", "syllabus", "modules", "discussions", "quizzes", "calendar", "inbox"]
 COMMAND_METAVAR = "{" + ", ".join(COMMANDS) + "}"
 SHORTCUT_COMMANDS = set(COMMANDS)
-INVALID_USAGE_MESSAGE = "Invalid usage, please follow the format: canvas {cmd} course [optional filter]"
-HELP_TEXT = """usage: canvas [-h, --help] [--json] [--date | --name]
-             {setup, home, courses, announcements, assignments, grades, people, pages, files, syllabus, modules}
+INVALID_USAGE_MESSAGE = "Invalid command. Run canvas --help for the supported commands."
+HELP_TEXT = """usage: canvas COMMAND [arguments] [options]
 
-Canvas LMS CLI
+A Command Line Interface for Canvas.
 
-options:
-  -h, --help  Show this help message
-  --json      Print pretty JSON instead of the default readable table
-  --date      Assignments filter: sort by descending due dates
-  --name      Assignments filter: sort names alphabetically
+Output:
+  --json          Return results as JSON
+  --agent         Return versioned JSON results
+  --no-input      Use saved sign-in without questions or windows
+  --all           courses only: include all returned and hidden courses
+  --date | --name  Sort assignments by latest due date or by name
+  --overwrite     files download only: replace an existing file
+  --max-bytes N   files download only: set the size limit in bytes
 
 Commands:
-    setup               Save your Canvas institution URL
-    home                Open the Canvas dashboard or a course home page
-    courses             List active courses
-    announcements       List announcements
-    assignments         List assignments
-    grades              List grades
-    people              List active people in a course
-    pages               List pages
-    files               Mirror course file links locally
-    syllabus            Open course syllabus page
-    modules             List modules
-
-Examples:
-    canvas setup https://school.instructure.com
-    canvas courses
-    canvas courses "PHY 382N"
-    canvas assignments phy382n
-    canvas grades phy
-    canvas modules 382n
-    canvas files "PHY 382N"
-    canvas home phy382n
-    canvas pages phy
-    canvas syllabus 382n
-    canvas people "PHY 382N"
-    canvas announcements phy382n
+  setup URL                        Save your school's Canvas website address
+  auth status                      Check whether you are signed in
+  auth login                       Connect your Canvas account using Chrome
+  capabilities                     Show commands, output formats, and limits
+  courses [COURSE]                 List courses
+  course COURSE outline            List tabs, modules, items, pages, and files
+  read URL                         Read a page, assignment, file or discussion
+  api PATH                         Read an /api/v1/ path, including all pages
+  assignments [COURSE]             List assignments and submission data
+  grades [COURSE]                  List grades and assignment groups
+  announcements [COURSE]           List announcements
+  people [COURSE]                  List people
+  pages COURSE                     List pages, or find them through modules
+  modules [COURSE]                 List modules and include items in JSON
+  discussions [COURSE]             List discussion topics
+  quizzes [COURSE]                 List quizzes available to your account
+  calendar [COURSE]                List events (next 30 days by default)
+  inbox [ID]                       List conversations or read a conversation
+  files COURSE                     Create local browser links
+  files list COURSE                Return file records
+  files download ID --output PATH  Save a file (100 MiB limit by default)
+  syllabus COURSE                  Open the syllabus, JSON returns its body
+  home [COURSE]                    Open Canvas or a course, JSON gives the URL
 """
+
+
+class CanvasArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        raise CanvasError("INVALID_USAGE", message)
 
 
 def parse_args(argv=None):
@@ -136,15 +152,23 @@ def parse_args(argv=None):
         sys.stdout.write(HELP_TEXT)
         raise SystemExit(0)
 
-    parser = argparse.ArgumentParser(
+    parser = CanvasArgumentParser(
         prog="canvas",
         usage=f"canvas [-h, --help] [--json] [--date | --name]\n             {COMMAND_METAVAR}",
-        description="Canvas LMS CLI",
+        description="A Command Line Interface for Canvas.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("endpoint", nargs="?", metavar=COMMAND_METAVAR, help=argparse.SUPPRESS)
     parser.add_argument("filters", nargs="*", help=argparse.SUPPRESS)
-    parser.add_argument("--json", action="store_true", help="Print pretty JSON instead of the default readable table")
+    parser.add_argument("--json", action="store_true", help="Return full Canvas records")
+    parser.add_argument("--agent", action="store_true")
+    parser.add_argument("--no-input", action="store_true")
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--output")
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--max-bytes", type=int, default=100 * 1024 * 1024)
+    parser.add_argument("--start-date")
+    parser.add_argument("--end-date")
 
     sort_group = parser.add_mutually_exclusive_group()
     sort_group.add_argument("--date", action="store_true", help="Assignments shortcut only: sort by due date descending")
@@ -177,28 +201,12 @@ def resolve_shortcut_command(endpoint: str, filters: list[str] | None = None) ->
 
 
 def normalize_endpoint(endpoint: str) -> str:
-    if endpoint.startswith("http://") or endpoint.startswith("https://"):
-        parsed = urlparse(endpoint)
-        if parsed.netloc != CANVAS_HOST:
-            raise SystemExit(f"Refusing non-configured Canvas host: {parsed.netloc}")
-        return parsed.path + (("?" + parsed.query) if parsed.query else "")
-    if not endpoint.startswith("/"):
-        endpoint = "/" + endpoint
-    return endpoint
+    return api_path(endpoint, BASE_URL)
 
 
 def next_url_from_link(link: str | None) -> str | None:
-    if not link:
-        return None
-    for part in link.split(","):
-        m = re.match(r'\s*<([^>]+)>;\s*rel="([^"]+)"', part)
-        if m and m.group(2) == "next":
-            url = m.group(1)
-            parsed = urlparse(url)
-            if parsed.netloc and parsed.netloc != CANVAS_HOST:
-                raise SystemExit(f"Refusing pagination to non-configured Canvas host: {parsed.netloc}")
-            return parsed.path + (("?" + parsed.query) if parsed.query else "")
-    return None
+    url = next_link(link)
+    return normalize_endpoint(url) if url else None
 
 
 def is_scalar(value) -> bool:
@@ -283,30 +291,7 @@ def config_int(config: dict | None, key: str, env_key: str, default: int) -> int
         return default
 
 
-def output_max_width(text: str) -> int:
-    lines = str(text).splitlines() or [""]
-    return max(len(line.rstrip()) for line in lines)
-
-
-def terminal_resize_target(text: str, config: dict | None = None) -> tuple[int, int]:
-    default_cols = config_int(config, "terminal_default_columns", "CANVAS_DEFAULT_COLS", 80)
-    default_rows = config_int(config, "terminal_default_rows", "CANVAS_DEFAULT_ROWS", 24)
-    width = output_max_width(text)
-    return (width if width > default_cols else default_cols, default_rows)
-
-
-def maybe_resize_terminal_for_output(text: str, config: dict | None = None) -> None:
-    if os.environ.get("CANVAS_AUTO_RESIZE", "1").lower() in {"0", "false", "no", "off"}:
-        return
-    if not sys.stdout.isatty():
-        return
-    cols, rows = terminal_resize_target(text, config)
-    sys.stdout.write(f"\x1b[8;{rows};{cols}t")
-    sys.stdout.flush()
-
-
 def print_human(text: str, config: dict | None = None) -> None:
-    maybe_resize_terminal_for_output(text, config)
     print(text)
 
 
@@ -537,13 +522,13 @@ def grade_rows(assignment_groups: list[dict], enrollment: dict | None = None, co
                 "grade_fraction": format_fraction(score, points),
                 "grade_percent": format_percent(score, points),
             })
-            if score is not None and points is not None and points > 0:
+            if score is not None and points is not None and points >= 0 and not (assignment.get("submission") or {}).get("excused"):
                 group_score += score
                 group_points += points
         if assignments:
             group_rows.append({
                 "course": course_value,
-                "name": singular_group_name(group.get('name')),
+                "name": singular_group_name(group.get('name')) + " (simple points)",
                 "grade_fraction": format_fraction(group_score if group_points else None, group_points if group_points else None),
                 "grade_percent": format_percent(group_score if group_points else None, group_points if group_points else None),
             })
@@ -558,7 +543,7 @@ def grade_rows(assignment_groups: list[dict], enrollment: dict | None = None, co
     if current_score is not None:
         rows.append({"course": course_value, "name": "Total", "grade_fraction": f"{format_score(current_score)}/100", "grade_percent": f"{format_score(current_score)}%"})
     elif total_points > 0:
-        rows.append({"course": course_value, "name": "Total", "grade_fraction": format_fraction(total_score, total_points), "grade_percent": format_percent(total_score, total_points)})
+        rows.append({"course": course_value, "name": "Total (simple points estimate)", "grade_fraction": format_fraction(total_score, total_points), "grade_percent": format_percent(total_score, total_points)})
     return rows
 
 
@@ -780,7 +765,7 @@ def people_rows(users: list[dict], course: dict | None = None) -> list[dict]:
         if not isinstance(user, dict):
             continue
         name = person_name(user).strip()
-        key = (course_value.lower(), name.lower())
+        key = (course_value.lower(), user.get("id") if user.get("id") is not None else name.lower())
         if not name or key in seen:
             continue
         seen.add(key)
@@ -1008,7 +993,7 @@ def page_rows(pages: list[dict], course: dict | None = None) -> list[dict]:
         if not isinstance(page, dict):
             continue
         title = page_title(page).strip()
-        key = (course_value.lower(), title.lower())
+        key = (course_value.lower(), page.get("page_id") or page.get("url") or title.lower())
         if not title or key in seen:
             continue
         seen.add(key)
@@ -1133,7 +1118,7 @@ def select_courses(courses: list[dict], filters: list[str] | None = None) -> lis
     matches = []
     for course in courses:
         text = course_search_text(course)
-        if query in text or (compact_query and compact_query in compact_course_search_text(text)):
+        if (str(course.get("id")) == query if query.isdigit() else query in text or (compact_query and compact_query in compact_course_search_text(text))):
             matches.append(course)
     selected.extend(matches)
     deduped = []
@@ -1208,22 +1193,6 @@ def parse_response_json(text: str):
         return None
 
 
-def canvas_error_messages(resp) -> list[str]:
-    data = parse_response_json(resp.text())
-    messages = []
-    if isinstance(data, dict):
-        status = data.get("status")
-        if status:
-            messages.append(str(status))
-        errors = data.get("errors") or []
-        if isinstance(errors, list):
-            for error in errors:
-                if isinstance(error, dict) and error.get("message"):
-                    messages.append(str(error.get("message")))
-    return messages
-
-
-
 def canvas_access_token_from_state_file(state_file: Path) -> str | None:
     try:
         data = json.loads(state_file.read_text())
@@ -1241,7 +1210,7 @@ def canvas_access_token_from_state_file(state_file: Path) -> str | None:
 
 
 def canvas_request_context_kwargs(state_file: Path) -> dict:
-    token = canvas_access_token_from_state_file(state_file)
+    token = os.environ.get("CANVAS_ACCESS_TOKEN") or canvas_access_token_from_state_file(state_file)
     if token:
         return {
             "base_url": BASE_URL,
@@ -1254,7 +1223,7 @@ def verify_canvas_state_file(playwright, state_file: Path) -> dict:
     req = playwright.request.new_context(**canvas_request_context_kwargs(state_file))
     interrupted = False
     try:
-        resp = req.get("/api/v1/users/self/profile", timeout=10000)
+        resp = request_get(req, BASE_URL, "/api/v1/users/self/profile", timeout=10000)
         if resp.status != 200:
             preview = ""
             try:
@@ -1491,9 +1460,7 @@ def storage_state_from_cookie_dbs(cookie_dbs: list[Path], keys: list[bytes]) -> 
     for cookie_db in cookie_dbs:
         db_cookies = []
         for key in key_candidates:
-            db_cookies = read_canvas_cookies_from_chrome_db(cookie_db, key=key)
-            if db_cookies:
-                break
+            db_cookies.extend(read_canvas_cookies_from_chrome_db(cookie_db, key=key))
         for cookie in db_cookies:
             identity = (cookie.get("domain"), cookie.get("path"), cookie.get("name"))
             if identity in seen:
@@ -1506,6 +1473,11 @@ def storage_state_from_cookie_dbs(cookie_dbs: list[Path], keys: list[bytes]) -> 
 
 
 def import_canvas_state_from_chrome(playwright, state_file: Path = STATE_FILE, config: dict | None = None) -> dict | None:
+    for state in live_states(BASE_URL):
+        try:
+            return import_canvas_storage_state(state, playwright, state_file=state_file)
+        except SystemExit:
+            continue
     state = storage_state_from_chrome(config)
     if not state:
         return None
@@ -1532,7 +1504,6 @@ class CanvasRequestSession:
         self.req = self.new_context()
 
     def refresh_auth_from_browser_session(self) -> bool:
-        forget_canvas_state_file(self.state_file)
         _, profile = import_canvas_state_from_browser_session(self.playwright, state_file=self.state_file, config=self.config)
         if profile is None:
             return False
@@ -1540,26 +1511,48 @@ class CanvasRequestSession:
         return True
 
     def wait_for_authentication(self) -> bool:
-        forget_canvas_state_file(self.state_file)
         _, profile = wait_for_canvas_authentication(self.playwright, state_file=self.state_file, config=self.config)
         if profile is None:
             return False
         self.recreate_context()
         return True
 
+    def download_headers(self, url):
+        if origin(url) != origin(BASE_URL):
+            return {}
+        token = os.environ.get("CANVAS_ACCESS_TOKEN") or canvas_access_token_from_state_file(self.state_file)
+        if token:
+            return {"Authorization": f"Bearer {token}"}
+        parsed = urlparse(url)
+        host, path, now = parsed.hostname or "", parsed.path or "/", time.time()
+        pairs = []
+        for cookie in self.req.storage_state().get("cookies", []):
+            domain = cookie.get("domain", "")
+            host_matches = host == domain.lstrip(".") or (domain.startswith(".") and host.endswith(domain))
+            cookie_path = cookie.get("path") or "/"
+            path_matches = path == cookie_path or path.startswith(cookie_path.rstrip("/") + "/")
+            expiry = cookie.get("expires", -1)
+            if not host_matches or not path_matches or (expiry != -1 and expiry <= now):
+                continue
+            if cookie.get("secure") and parsed.scheme != "https":
+                continue
+            pairs.append(f"{cookie['name']}={cookie['value']}")
+        return {"Cookie": "; ".join(pairs)} if pairs else {}
+
     def get(self, endpoint: str):
-        resp = self.req.get(endpoint)
-        if resp.status != 401 or self.tried_auth_refresh:
+        timeout = config_int(self.config, "request_timeout_seconds", "CANVAS_REQUEST_TIMEOUT_SECONDS", 30) * 1000
+        resp = request_get(self.req, BASE_URL, endpoint, timeout=timeout)
+        if resp.status != 401 or self.tried_auth_refresh or self.config.get("no_input"):
+            return resp
+        if os.environ.get("CANVAS_ACCESS_TOKEN") or canvas_access_token_from_state_file(self.state_file):
             return resp
         self.tried_auth_refresh = True
-        if self.refresh_auth_from_browser_session():
-            return self.req.get(endpoint)
-        if self.wait_for_authentication():
-            return self.req.get(endpoint)
-        request_canvas_authentication(state_file=self.state_file, config=self.config)
+        if self.refresh_auth_from_browser_session() or self.wait_for_authentication():
+            resp.dispose()
+            return request_get(self.req, BASE_URL, endpoint, timeout=timeout)
+        return resp
 
 
-AUTH_REQUIRED_MESSAGE = "Authenticating..."
 AUTH_CANCELLED_MESSAGE = "Authentication cancelled."
 MANUAL_STATE_HELP = "Open Canvas in Google Chrome and log in, then rerun this command."
 
@@ -1607,23 +1600,6 @@ def import_canvas_state_from_chrome_if_available(playwright, state_file: Path = 
         return None
 
 
-def run_osascript(script: str) -> str | None:
-    try:
-        result = subprocess.run(
-            ["osascript"],
-            input=script,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=20,
-        )
-    except Exception:
-        return None
-    if result.returncode != 0:
-        return None
-    return result.stdout.strip()
-
-
 def import_canvas_state_from_browser_session(playwright, state_file: Path = STATE_FILE, config: dict | None = None) -> tuple[str | None, dict | None]:
     profile = import_canvas_state_from_chrome_if_available(playwright, state_file=state_file, config=config)
     if profile is not None:
@@ -1631,54 +1607,45 @@ def import_canvas_state_from_browser_session(playwright, state_file: Path = STAT
     return None, None
 
 
-def focus_existing_chrome_canvas_tab() -> bool:
-    script = f"""
-tell application {json.dumps(CHROME_APP_NAME)}
-    repeat with browserWindow in windows
-        set tabIndex to 1
-        repeat with browserTab in tabs of browserWindow
-            if URL of browserTab starts with {json.dumps(BASE_URL)} then
-                set active tab index of browserWindow to tabIndex
-                set index of browserWindow to 1
-                activate
-                return "found"
-            end if
-            set tabIndex to tabIndex + 1
-        end repeat
-    end repeat
-end tell
-""".strip()
-    return run_osascript(script) == "found"
+def canvas_chrome_app_path() -> Path | None:
+    """Find a Chrome app for the configured Canvas website."""
+    for directory in CHROME_APP_DIRS:
+        for app in sorted(directory.glob("*.app")):
+            try:
+                info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+                if not isinstance(info, dict):
+                    continue
+                bundle_id = info.get("CFBundleIdentifier", "")
+                url = info.get("CrAppModeShortcutURL", "")
+                if (isinstance(bundle_id, str) and isinstance(url, str)
+                        and bundle_id.startswith("com.google.Chrome.app.")
+                        and origin(url) == origin(BASE_URL)):
+                    return app
+            except (OSError, ValueError, plistlib.InvalidFileException, CanvasError):
+                continue
+    return None
 
 
 def open_canvas_in_chrome(config: dict | None = None) -> None:
     del config
-    if focus_existing_chrome_canvas_tab():
-        return
-    args = ["open", "-a", CHROME_APP_NAME, BASE_URL]
-    subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-
-def forget_canvas_state_file(state_file: Path = STATE_FILE) -> None:
+    app = canvas_chrome_app_path()
+    if app is None:
+        raise CanvasError("AUTH_REQUIRED", f"Canvas app for {BASE_URL} was not found. Install your Canvas website as a Chrome app, then run canvas auth login.")
+    args = ["open", "-a", str(app), BASE_URL]
     try:
-        state_file.unlink()
-    except FileNotFoundError:
-        pass
-    except OSError:
-        pass
+        result = subprocess.run(args, check=False, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL, timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if result is None or result.returncode != 0:
+        raise CanvasError("AUTH_REQUIRED", "The Canvas app could not open. Open it and sign in, then run canvas auth login.")
 
 
-def request_canvas_authentication(state_file: Path | None = None, config: dict | None = None) -> None:
-    if state_file is not None:
-        forget_canvas_state_file(state_file)
-    open_canvas_in_chrome(config=config)
-    raise SystemExit(AUTH_REQUIRED_MESSAGE)
-
-
-def wait_for_canvas_authentication(playwright, state_file: Path = STATE_FILE, config: dict | None = None) -> tuple[str | None, dict | None]:
+def wait_for_canvas_authentication(playwright, state_file: Path = STATE_FILE, config: dict | None = None, *, announce: bool = True) -> tuple[str | None, dict | None]:
     if not canvas_auto_open_chrome_enabled(config):
-        raise SystemExit(AUTH_REQUIRED_MESSAGE)
-    print(AUTH_REQUIRED_MESSAGE, file=sys.stderr, flush=True)
+        raise CanvasError("AUTH_REQUIRED", MANUAL_STATE_HELP)
+    if announce:
+        print("Authenticating...", file=sys.stderr, flush=True)
     open_canvas_in_chrome(config=config)
     deadline = time.monotonic() + canvas_chrome_login_timeout_seconds(config)
     poll_interval = canvas_auth_poll_interval_seconds(config)
@@ -1687,243 +1654,368 @@ def wait_for_canvas_authentication(playwright, state_file: Path = STATE_FILE, co
         if profile is not None:
             return source, profile
         if time.monotonic() >= deadline:
-            raise SystemExit(AUTH_REQUIRED_MESSAGE)
+            raise CanvasError("AUTH_REQUIRED", "Canvas sign-in is not ready. Sign in in the Canvas app, then run canvas auth login.")
         time.sleep(poll_interval)
 
 
 def ensure_ok(resp):
-    if resp.status == 401:
-        request_canvas_authentication()
-    if resp.status == 403:
-        messages = canvas_error_messages(resp)
-        detail = "; ".join(messages)
-        lower_detail = detail.lower()
-        if "user not authorized" in lower_detail or "unauthorized" in lower_detail:
-            raise SystemExit("Canvas access denied (403); this course/resource is not available to your account.")
-        raise SystemExit(f"Canvas auth failed (403); {MANUAL_STATE_HELP}")
-    if resp.status < 200 or resp.status >= 300:
-        raise SystemExit(f"HTTP {resp.status}: {resp.text()[:500]}")
+    ensure_response(resp)
 
 
 def fetch_paginated(req, endpoint: str):
-    out = []
-    url = endpoint
-    while url:
-        resp = req.get(url)
-        ensure_ok(resp)
-        data = resp.json()
-        if not isinstance(data, list):
-            raise SystemExit("Paginated Canvas endpoint expected each page to be a JSON array")
-        out.extend(data)
-        url = next_url_from_link(resp.headers.get("link"))
-    return out
+    return fetch_json(req, endpoint, BASE_URL, expect_list=True)
 
+
+def error_exit_code(error):
+    if error.code == "AUTH_REQUIRED":
+        return 3
+    if error.code in {"ACCESS_DENIED", "NOT_FOUND", "PARTIAL_RESULT"}:
+        return 4
+    if error.retryable or error.code in {"HTTP_ERROR", "NETWORK_ERROR", "DOWNLOAD_FAILED"}:
+        return 5
+    return 2
+
+
+def emit_result(data, args, config=None, *, text=None, errors=None):
+    errors = errors or []
+    if args.agent or errors:
+        result = {"schema_version": 1, "data": data, "errors": errors, "complete": not errors,
+                  "source": {"base_url": BASE_URL, "fetched_at": datetime.now(timezone.utc).isoformat()}}
+    else:
+        result = data
+    if args.json or args.agent:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+    else:
+        print_human(text if text is not None else render_human(data), config)
+        for error in errors:
+            print(f"{error['code']}: {error['message']}", file=sys.stderr)
+    if errors:
+        raise SystemExit(4)
+
+
+def command_capabilities():
+    return {"version": "0.2.1", "schema_version": 1, "read_only": True, "commands": COMMANDS,
+            "output": {"json": "Full Canvas records, errors use the agent result format.",
+                       "agent": "schema_version, data, errors, complete, source, no browser or prompts."},
+            "exit_codes": {"0": "complete", "2": "invalid request", "3": "sign-in required", "4": "access or partial result", "5": "network or server error", "130": "cancelled"},
+            "read_types": ["course", "syllabus", "page", "assignment", "submission", "discussion", "quiz", "module", "file metadata", "conversation", "API JSON"],
+            "limits": ["External services need separate access.", "File reads return file details, use files download to save content.", "A disabled list can prevent a complete course listing.", "The program does not submit work, send messages, or start quizzes."],
+            "examples": ["canvas courses --agent", "canvas course 123 outline --agent", "canvas read /courses/123/pages/guide --agent", "canvas files download 456 --output notes.pdf --agent"]}
+
+
+def render_capabilities(data):
+    lines = [f"Canvas {data['version']}",
+             f"Agent output version: {data['schema_version']}",
+             "Canvas access: read only", "", "Commands:"]
+    lines.append(textwrap.fill(", ".join(data["commands"]), width=78,
+                               initial_indent="  ", subsequent_indent="  "))
+    lines.extend(["", "Output:"])
+    for name, description in data["output"].items():
+        lines.append(textwrap.fill(f"--{name}  {description}", width=78,
+                                   initial_indent="  ", subsequent_indent="    "))
+    lines.extend(["", "Readable content:"])
+    names = {"file metadata": "file details", "API JSON": "Canvas API results"}
+    content = ", ".join(names.get(kind, kind) for kind in data["read_types"])
+    lines.append(textwrap.fill(content, width=78,
+                               initial_indent="  ", subsequent_indent="  "))
+    lines.extend(["", "Limits:"])
+    lines.extend(f"  {limit}" for limit in data["limits"])
+    lines.extend(["", "Exit codes:"])
+    lines.extend(f"  {code}  {meaning}" for code, meaning in data["exit_codes"].items())
+    return "\n".join(lines)
 
 
 def main(argv=None):
+    arguments = list(sys.argv[1:] if argv is None else argv)
     try:
-        return _main(argv)
+        return _main(arguments)
+    except CanvasError as exc:
+        error = exc
     except KeyboardInterrupt:
-        raise SystemExit(AUTH_CANCELLED_MESSAGE)
+        error = CanvasError("CANCELLED", AUTH_CANCELLED_MESSAGE)
+    except SystemExit as exc:
+        if exc.code is None or isinstance(exc.code, int):
+            raise
+        error = CanvasError("INVALID_USAGE", str(exc))
+    except PlaywrightError:
+        error = CanvasError("NETWORK_ERROR", "Canvas could not start a request. Check the saved sign-in and connection.", retryable=True)
+    except (OSError, ValueError) as exc:
+        error = CanvasError("LOCAL_ERROR", "The local configuration, saved sign-in, or file could not be read or written.")
+    if "--json" in arguments or "--agent" in arguments:
+        print(json.dumps({"schema_version": 1, "data": error.data, "errors": [error.as_dict()], "complete": False,
+                          "source": {"base_url": BASE_URL}}, indent=2, ensure_ascii=False))
+    else:
+        print(f"{error.code}: {error}", file=sys.stderr)
+    raise SystemExit(130 if error.code == "CANCELLED" else error_exit_code(error))
 
 
 def _main(argv=None):
     args = parse_args(argv)
     if args.endpoint is None:
-        sys.stdout.write(HELP_TEXT)
+        print(HELP_TEXT, end="")
         return
-
-    config = load_config(CONFIG_FILE)
     command, filters = resolve_shortcut_command(args.endpoint, args.filters)
-
-    if command == "setup":
-        setup_canvas_institution(filters, config, config_file=CONFIG_FILE)
+    if args.all and command != "courses":
+        raise CanvasError("INVALID_USAGE", "Use --all with courses.")
+    if (args.date or args.name) and command != "assignments":
+        raise CanvasError("INVALID_USAGE", "Use --date or --name with assignments.")
+    if (args.start_date or args.end_date) and command not in {"calendar", "announcements"}:
+        raise CanvasError("INVALID_USAGE", "Date ranges apply to calendar and announcements.")
+    for date in (args.start_date, args.end_date):
+        if date:
+            try:
+                datetime.strptime(date, "%Y-%m-%d")
+            except ValueError as exc:
+                raise CanvasError("INVALID_USAGE", "Use dates in YYYY-MM-DD format.") from exc
+    if args.start_date and args.end_date and args.start_date > args.end_date:
+        raise CanvasError("INVALID_USAGE", "The start date must not follow the end date.")
+    if command == "capabilities":
+        if filters:
+            raise CanvasError("INVALID_USAGE", "Use canvas capabilities without arguments.")
+        data = command_capabilities()
+        emit_result(data, args, text=render_capabilities(data))
         return
-
+    config = load_config(CONFIG_FILE)
+    config["no_input"] = args.no_input or args.agent or not sys.stdin.isatty()
+    if command == "setup":
+        if len(filters) > 1 or (not filters and config["no_input"]):
+            raise CanvasError("INVALID_USAGE", "Use canvas setup https://school.instructure.com")
+        if filters:
+            value = filters[0]
+        else:
+            print("Canvas institution URL: ", file=sys.stderr, end="", flush=True)
+            value = sys.stdin.readline().strip()
+        value = normalize_canvas_base_url(value)
+        saved = load_config(CONFIG_FILE); saved["base_url"] = value
+        save_config(saved, CONFIG_FILE); set_canvas_base_url(value)
+        emit_result({"base_url": value}, args, text=f"Saved Canvas institution: {value}")
+        return
     apply_canvas_base_url(config, state_file=STATE_FILE)
-
-    if not STATE_FILE.exists():
+    if command == "auth":
+        if filters not in (["status"], ["login"]):
+            raise CanvasError("INVALID_USAGE", "Use canvas auth status or canvas auth login.")
+        if filters == ["login"]:
+            if args.agent or args.no_input:
+                raise CanvasError("INVALID_USAGE", "Run canvas auth login in a terminal without --agent or --no-input.")
+            print("Authenticating...", file=sys.stderr, flush=True)
+            with sync_playwright() as p:
+                _, profile = import_canvas_state_from_browser_session(p, state_file=STATE_FILE, config=config)
+                if profile is None:
+                    _, profile = wait_for_canvas_authentication(p, state_file=STATE_FILE, config=config, announce=False)
+            if profile is None:
+                raise CanvasError("AUTH_REQUIRED", MANUAL_STATE_HELP)
+            if args.json:
+                emit_result({"authenticated": True, "user_id": profile.get("id")}, args)
+            return
+        config["no_input"] = True
+    if command == "home" and not filters:
+        url = dashboard_home_url()
+        if not (args.json or args.agent or args.no_input):
+            open_url(url)
+        emit_result({"url": url}, args, config, text=url if args.no_input else f"Opened {url}")
+        return
+    # Validate command forms before sign-in or network access.
+    raw_path = None
+    if command == "api":
+        if len(filters) != 1:
+            raise CanvasError("INVALID_USAGE", "Use canvas api /api/v1/path")
+        raw_path = normalize_endpoint(filters[0])
+    elif command not in SHORTCUT_COMMANDS:
+        if filters:
+            raise CanvasError("INVALID_USAGE", "A raw API path cannot have extra arguments.")
+        raw_path = normalize_endpoint(args.endpoint)
+    elif command == "read" and len(filters) != 1:
+        raise CanvasError("INVALID_USAGE", "Use canvas read URL")
+    elif command == "course" and (len(filters) != 2 or filters[1] != "outline"):
+        raise CanvasError("INVALID_USAGE", "Use canvas course COURSE outline")
+    elif command in {"pages", "syllabus"}:
+        require_course_filter(command, filters)
+    elif command == "files":
+        if filters and filters[0] == "download":
+            if len(filters) != 2 or not filters[1].isdigit() or not args.output or args.max_bytes < 1:
+                raise CanvasError("INVALID_USAGE", "Use canvas files download ID --output PATH with a positive --max-bytes value.")
+        elif filters and filters[0] == "list":
+            require_course_filter("files list", filters[1:])
+        else:
+            require_course_filter("files", filters)
+    if (args.output or args.overwrite) and not (command == "files" and filters[:1] == ["download"]):
+        raise CanvasError("INVALID_USAGE", "Use --output and --overwrite with files download.")
+    if not STATE_FILE.exists() and not os.environ.get("CANVAS_ACCESS_TOKEN"):
+        if config["no_input"]:
+            raise CanvasError("AUTH_REQUIRED", "No saved sign-in. Run canvas auth login in a terminal, or set CANVAS_ACCESS_TOKEN.")
         with sync_playwright() as p:
             _, profile = import_canvas_state_from_browser_session(p, state_file=STATE_FILE, config=config)
             if profile is None:
-                _, profile = wait_for_canvas_authentication(p, state_file=STATE_FILE, config=config)
-        if profile is None:
-            request_canvas_authentication(config=config)
-
-    endpoint = None if command in SHORTCUT_COMMANDS else normalize_endpoint(args.endpoint)
+                wait_for_canvas_authentication(p, state_file=STATE_FILE, config=config)
     with sync_playwright() as p:
         req = CanvasRequestSession(p, state_file=STATE_FILE, config=config)
+        content = CanvasContent(req, BASE_URL)
+        if command == "auth":
+            profile = fetch_json(req, "/api/v1/users/self/profile", BASE_URL)
+            emit_result({"authenticated": True, "user_id": profile.get("id")}, args, config, text="Canvas sign-in is ready.")
+            return
+        if raw_path:
+            emit_result(fetch_json(req, raw_path, BASE_URL), args, config)
+            return
+        if command == "read":
+            result = content.read(filters[0])
+            emit_result(result, args, config, text=result.get("text") or json.dumps(result, indent=2, ensure_ascii=False), errors=content.errors)
+            return
+        if command == "files" and filters[0] == "download":
+            info = fetch_json(req, f"/api/v1/files/{filters[1]}", BASE_URL)
+            result = download_file(info, args.output, BASE_URL, overwrite=args.overwrite, max_bytes=args.max_bytes, credential_headers=req.download_headers)
+            emit_result(result, args, config, text=f"Saved {result['path']} ({result['size']} bytes)")
+            return
+        if command == "inbox":
+            if len(filters) > 1 or (filters and not filters[0].isdigit()):
+                raise CanvasError("INVALID_USAGE", "Use canvas inbox or canvas inbox ID.")
+            endpoint = f"/api/v1/conversations/{filters[0]}?auto_mark_as_read=false" if filters else "/api/v1/conversations?per_page=100"
+            emit_result(fetch_json(req, endpoint, BASE_URL), args, config)
+            return
+        if command == "course" and filters[0].isdigit():
+            result = content.outline(filters[0])
+            emit_result(result, args, config, text=json.dumps(result, indent=2, ensure_ascii=False), errors=content.errors)
+            return
+        params = "per_page=100" if args.all else "enrollment_state=active&per_page=100"
         if command == "courses":
-            courses = fetch_paginated(req, "/api/v1/courses?enrollment_state=active&include[]=sections&include[]=teachers&per_page=100")
+            params = ("" if args.all else "enrollment_state=active&") + "include[]=sections&include[]=teachers&per_page=100"
+        courses = fetch_paginated(req, "/api/v1/courses?" + params)
+        if not args.all:
             courses = filter_hidden_courses(courses, config)
-            if filters:
-                courses = select_courses(courses, filters)
-            rows = course_rows(courses)
-            if args.json:
-                print(json.dumps(rows, indent=2, ensure_ascii=False))
-            else:
-                print_human(render_courses(rows), config)
-            return
-
-        if command == "home":
-            if filters:
-                courses = fetch_paginated(req, "/api/v1/courses?enrollment_state=active&per_page=100")
-                url = course_home_url(select_single_course(courses, filters, command="home"))
-            else:
-                url = dashboard_home_url()
-            if args.json:
-                print(json.dumps({"url": url}, indent=2, ensure_ascii=False))
-            else:
-                open_url(url)
-                print(f"Opened {url}")
-            return
-
-        if command == "syllabus":
-            courses = fetch_paginated(req, "/api/v1/courses?enrollment_state=active&per_page=100")
-            courses = filter_hidden_courses(courses, config)
-            url = course_syllabus_url(select_single_course(courses, filters, command="syllabus"))
-            if args.json:
-                print(json.dumps({"url": url}, indent=2, ensure_ascii=False))
-            else:
-                open_url(url)
-                print(f"Opened {url}")
-            return
-
-        if command == "modules":
-            courses = fetch_paginated(req, "/api/v1/courses?enrollment_state=active&per_page=100")
-            courses = filter_hidden_courses(courses, config)
-            if filters:
-                courses = select_courses(courses, filters)
-            rows = []
-            for course in courses:
-                course_id = course.get("id")
-                if not course_id:
-                    continue
-                modules = fetch_paginated(req, f"/api/v1/courses/{course_id}/modules?per_page=100")
-                rows.extend(module_rows(modules, course))
-            if args.json:
-                print(json.dumps(rows, indent=2, ensure_ascii=False))
-            else:
-                print_human(render_modules(rows), config)
-            return
-
-        if command == "assignments":
-            courses = fetch_paginated(req, "/api/v1/courses?enrollment_state=active&per_page=100")
-            courses = filter_hidden_courses(courses, config)
-            if filters:
-                courses = select_courses(courses, filters)
-            rows = []
-            for course in courses:
-                course_id = course.get("id")
-                if not course_id:
-                    continue
-                assignments = fetch_paginated(req, f"/api/v1/courses/{course_id}/assignments?include[]=submission&per_page=100")
-                rows.extend(assignment_rows(assignments, course))
-            sort_by = "date" if args.date else "name" if args.name else None
-            rows = sort_assignment_rows(rows, sort_by=sort_by)
-            if args.json:
-                print(json.dumps(rows, indent=2, ensure_ascii=False))
-            else:
-                print_human(render_assignments(rows), config)
-            return
-
-        if command == "grades":
-            courses = fetch_paginated(req, "/api/v1/courses?enrollment_state=active&per_page=100")
-            courses = filter_hidden_courses(courses, config)
-            if filters:
-                courses = select_courses(courses, filters)
-            enrollments = fetch_paginated(req, "/api/v1/users/self/enrollments?type[]=StudentEnrollment&state[]=active&per_page=100")
-            enrollment_by_course = {enrollment.get("course_id"): enrollment for enrollment in enrollments if isinstance(enrollment, dict)}
-            sections = []
-            for course in courses:
-                course_id = course.get("id")
-                if not course_id:
-                    continue
-                groups = fetch_paginated(req, f"/api/v1/courses/{course_id}/assignment_groups?include[]=assignments&include[]=submission&per_page=100")
-                rows = grade_rows(groups, enrollment_by_course.get(course_id), course)
-                sections.append({"course": course, "rows": rows})
-            if args.json:
-                print(json.dumps(grade_json_rows(sections), indent=2, ensure_ascii=False))
-            else:
-                print_human(render_grade_sections(sections), config)
-            return
-
-        if command == "announcements":
-            courses = fetch_paginated(req, "/api/v1/courses?enrollment_state=active&per_page=100")
-            selected_courses = select_courses(courses, filters)
-            announcements = fetch_paginated(req, announcement_endpoint(selected_courses))
-            announcements.sort(key=lambda item: item.get("posted_at") or item.get("created_at") or "", reverse=True)
-            rows = announcement_rows(announcements, selected_courses)
-            if args.json:
-                print(json.dumps(rows, indent=2, ensure_ascii=False))
-            else:
-                print_human(render_announcements(rows), config)
-            return
-
-        if command == "people":
-            courses = fetch_paginated(req, "/api/v1/courses?enrollment_state=active&per_page=100")
-            courses = filter_hidden_courses(courses, config)
-            selected_courses = select_courses(courses, filters)
-            rows = []
-            for course in selected_courses:
-                course_id = course.get("id")
-                if not course_id:
-                    continue
-                users = fetch_paginated(req, f"/api/v1/courses/{course_id}/users?enrollment_state[]=active&per_page=100")
-                rows.extend(people_rows(users, course))
-            rows.sort(key=lambda row: ((row.get("course") or "").lower(), (row.get("name") or "").lower()))
-            if args.json:
-                print(json.dumps(rows, indent=2, ensure_ascii=False))
-            else:
-                print_human(render_people(rows), config)
-            return
-
-        if command == "files":
-            require_files_course_filter(filters)
-            courses = fetch_paginated(req, "/api/v1/courses?enrollment_state=active&per_page=100")
-            courses = filter_hidden_courses(courses, config)
-            course = select_single_course(courses, filters, command="files")
-            course_id = course.get("id")
-            if not course_id:
-                raise SystemExit("Selected course has no Canvas ID")
-            local_root = local_course_files_root(course)
-            root_folder = fetch_course_root_folder(req, course_id)
-            result = download_canvas_folder_tree(req, root_folder, local_root, course_id=course_id)
-            if args.json:
-                print(json.dumps(result, indent=2, ensure_ascii=False))
-            else:
-                print_human(render_files_sync_result(result), config)
-            return
-
-        if command == "pages":
-            require_pages_course_filter(filters)
-            courses = fetch_paginated(req, "/api/v1/courses?enrollment_state=active&per_page=100")
-            courses = filter_hidden_courses(courses, config)
-            selected_courses = select_courses(courses, filters)
-            rows = []
-            for course in selected_courses:
-                course_id = course.get("id")
-                if not course_id:
-                    continue
-                pages = fetch_paginated(req, f"/api/v1/courses/{course_id}/pages?per_page=100")
-                rows.extend(page_rows(pages, course))
-            rows.sort(key=lambda row: ((row.get("course") or "").lower(), (row.get("title") or "").lower()))
-            if args.json:
-                print(json.dumps(strip_private_keys(rows), indent=2, ensure_ascii=False))
-            else:
-                print_human(render_pages(rows), config)
-            return
-
-        resp = req.get(endpoint)
-        text = resp.text()
-        ensure_ok(resp)
-        data = parse_response_json(text)
-        if data is None:
-            print(text)
-        elif args.json:
-            print(json.dumps(data, indent=2, ensure_ascii=False))
+        if command == "files" and filters[0] == "list":
+            course_filters = filters[1:]
+        elif command == "course":
+            course_filters = filters[:1]
         else:
-            print_human(render_human(data, endpoint), config)
+            course_filters = filters
+        selected = select_courses(courses, course_filters)
+        if command == "courses":
+            emit_result(selected, args, config, text=render_courses(course_rows(selected)))
+            return
+        if command in {"home", "syllabus", "course"}:
+            course = select_single_course(courses, course_filters, command=command)
+            if command == "course":
+                result = content.outline(course["id"])
+                emit_result(result, args, config, text=json.dumps(result, indent=2, ensure_ascii=False), errors=content.errors)
+                return
+            url = course_home_url(course) if command == "home" else course_syllabus_url(course)
+            data = {"url": url}
+            if command == "syllabus" and (args.json or args.agent):
+                data = fetch_json(req, f"/api/v1/courses/{course['id']}?include[]=syllabus_body", BASE_URL)
+            elif not (args.json or args.agent or args.no_input):
+                open_url(url)
+            emit_result(data, args, config, text=url if args.no_input else f"Opened {url}")
+            return
+        if command == "files" and filters[0] != "list":
+            course = select_single_course(courses, course_filters, command="files")
+            root = fetch_course_root_folder(req, course["id"])
+            result = download_canvas_folder_tree(req, root, local_course_files_root(course), course_id=course["id"])
+            emit_result(result, args, config, text=render_files_sync_result(result))
+            return
+        if command == "announcements":
+            endpoint = announcement_endpoint(selected)
+            if args.start_date or args.end_date:
+                from urllib.parse import parse_qsl
+                fields = dict(parse_qsl(endpoint.partition("?")[2]))
+                fields["start_date"] = args.start_date or fields["start_date"]
+                fields["end_date"] = args.end_date or fields["end_date"]
+                endpoint = "/api/v1/announcements?" + urlencode([("context_codes[]", f"course_{course['id']}") for course in selected] + [(key, value) for key, value in fields.items() if key != "context_codes[]"])
+            data = fetch_paginated(req, endpoint) if selected else []
+            data.sort(key=lambda item: item.get("posted_at") or item.get("created_at") or "", reverse=True)
+            emit_result(data, args, config, text=render_announcements(announcement_rows(data, selected)))
+            return
+        if command == "calendar":
+            now = datetime.now(timezone.utc)
+            params = [("context_codes[]", f"course_{course['id']}") for course in selected]
+            if not filters:
+                profile = fetch_json(req, "/api/v1/users/self/profile", BASE_URL)
+                params.append(("context_codes[]", f"user_{profile['id']}"))
+            date_params = [("start_date", args.start_date or now.date().isoformat()), ("end_date", args.end_date or (now + timedelta(days=30)).date().isoformat()), ("per_page", "100")]
+            data, errors, seen = [], [], set()
+            for start in range(0, len(params), 10):
+                try:
+                    batch = fetch_paginated(req, "/api/v1/calendar_events?" + urlencode(params[start:start + 10] + date_params))
+                except CanvasError as exc:
+                    errors.append(exc.as_dict()); batch = exc.data or []
+                for event in batch:
+                    key = event.get("id")
+                    if key is None or key not in seen:
+                        data.append(event); seen.add(key)
+            emit_result(data, args, config, errors=errors)
+            return
+        enrollments = {}
+        if command == "grades":
+            records = fetch_paginated(req, "/api/v1/users/self/enrollments?type[]=StudentEnrollment&state[]=active&per_page=100")
+            enrollments = {record.get("course_id"): record for record in records}
+        records, rows, sections, errors = [], [], [], []
+        for course in selected:
+            cid = course.get("id")
+            if not cid:
+                continue
+            prefix = f"/api/v1/courses/{cid}"
+            try:
+                if command == "assignments":
+                    data = fetch_paginated(req, prefix + "/assignments?include[]=submission&per_page=100")
+                    rows.extend(assignment_rows(data, course))
+                elif command == "modules":
+                    data = content.modules(cid) if args.json or args.agent else fetch_paginated(req, prefix + "/modules?per_page=100")
+                    rows.extend(module_rows(data, course))
+                elif command == "pages":
+                    data = content.pages(cid)
+                    rows.extend(page_rows(data, course))
+                elif command == "people":
+                    data = fetch_paginated(req, prefix + "/users?enrollment_state[]=active&per_page=100")
+                    rows.extend(people_rows(data, course))
+                elif command == "grades":
+                    data = fetch_paginated(req, prefix + "/assignment_groups?include[]=assignments&include[]=submission&per_page=100")
+                    sections.append({"course": course, "rows": grade_rows(data, enrollments.get(cid), course)})
+                    records.append({"course": course, "enrollment": enrollments.get(cid), "assignment_groups": data})
+                    continue
+                elif command in {"discussions", "quizzes", "files"}:
+                    resource = "discussion_topics" if command == "discussions" else command
+                    data = fetch_paginated(req, prefix + f"/{resource}?per_page=100")
+                else:
+                    raise CanvasError("INVALID_USAGE", INVALID_USAGE_MESSAGE)
+                for record in data:
+                    if isinstance(record, dict):
+                        record = dict(record)
+                        record.setdefault("course_id", cid)
+                        record.setdefault("course_code", course_code(course))
+                    records.append(record)
+            except CanvasError as exc:
+                detail = exc.as_dict(); detail["course_id"] = cid; errors.append(detail)
+                if isinstance(exc.data, list):
+                    if command == "grades":
+                        records.append({"course": course, "enrollment": enrollments.get(cid), "assignment_groups": exc.data})
+                        sections.append({"course": course, "rows": grade_rows(exc.data, enrollments.get(cid), course)})
+                    else:
+                        row_builder = {"assignments": assignment_rows, "modules": module_rows, "pages": page_rows, "people": people_rows}.get(command)
+                        if row_builder:
+                            rows.extend(row_builder(exc.data, course))
+                        for record in exc.data:
+                            if isinstance(record, dict):
+                                record = dict(record); record.setdefault("course_id", cid)
+                            records.append(record)
+        errors.extend(content.errors)
+        if command == "assignments":
+            sort_by = "date" if args.date else "name" if args.name else None
+            rows = sort_assignment_rows(rows, sort_by)
+            if args.name:
+                records.sort(key=lambda row: (str(row.get("course_code", "")).lower(), str(row.get("name", "")).lower()))
+            elif args.date:
+                records.sort(key=lambda row: row.get("due_at") or "", reverse=True)
+            text = render_assignments(rows)
+        elif command == "grades":
+            text = render_grade_sections(sections)
+        elif command == "modules":
+            text = render_modules(rows)
+        elif command == "people":
+            text = render_people(sorted(rows, key=lambda row: (row["course"], row["name"])))
+        elif command == "pages":
+            text = render_pages(sorted(rows, key=lambda row: (row["course"], row["title"])))
+        else:
+            text = render_human(records)
+        emit_result(records, args, config, text=text, errors=errors)
 
 
 if __name__ == "__main__":
